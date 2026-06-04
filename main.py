@@ -60,8 +60,9 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8873566235:AAFWgBkP8VjoB09mw0uXWoz9sJ70bSQfV1Y")
 CHAT_ID       = os.environ.get("CHAT_ID", "5028065177")
-PROXY_FOLDER  = os.environ.get("PROXY_FOLDER", "./data/proxy")
-COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", "./data/combo")
+APP_DIR       = os.path.dirname(os.path.abspath(__file__))
+PROXY_FOLDER  = os.environ.get("PROXY_FOLDER", os.path.join(APP_DIR, "data", "proxy") if os.path.isdir(os.path.join(APP_DIR, "data", "proxy")) else APP_DIR)
+COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", os.path.join(APP_DIR, "data", "combo") if os.path.isdir(os.path.join(APP_DIR, "data", "combo")) else APP_DIR)
 COOKIE_FILE   = os.environ.get("COOKIE_FILE", "./data/full_cookie.txt")
 COOKIE_FOLDER = os.environ.get("COOKIE_FOLDER", "./data/cookies")  # folder for batch cookie files
 API_PORT      = int(os.environ.get("API_PORT", "8080"))
@@ -2043,10 +2044,25 @@ class DataDomeFetcher:
                 )
                 latency = int((time.time() - t0) * 1000)
                 resp.raise_for_status()
-                body = resp.json()
+                try:
+                    body = resp.json()
+                except ValueError:
+                    preview = (resp.text or "")[:120].replace("\n", " ").replace("\r", " ")
+                    err = f"Non-JSON DD response status={resp.status_code} body={preview!r}"
+                    logger.debug(f"[FETCH] {err} | proxy: {proxy_url}")
+                    last_error = err
+                    self.scanner.record_proxy_failure(proxy_url)
+                    continue
 
                 if body.get("status") == 200 and "cookie" in body:
-                    dd = body["cookie"].split(";")[0].split("=", 1)[1]
+                    try:
+                        dd = body["cookie"].split(";")[0].split("=", 1)[1]
+                    except Exception:
+                        err = f"Malformed DD cookie body: {str(body)[:120]}"
+                        logger.debug(f"[FETCH] {err} | proxy: {proxy_url}")
+                        last_error = err
+                        self.scanner.record_proxy_failure(proxy_url)
+                        continue
                     # ── Mark proxy as healthy ──
                     self.scanner.record_proxy_success(proxy_url)
                     return {"success": True, "datadome": dd, "proxy": self.scanner.current_display(), "error": None, "latency_ms": latency}
@@ -2083,6 +2099,7 @@ class DataDomeFetcher:
             except Exception as e:
                 logger.debug(f"[FETCH] Error on {proxy_url}: {e}")
                 last_error = f"{type(e).__name__}: {str(e)[:80]}"
+                self.scanner.record_proxy_failure(proxy_url)
                 continue
 
             finally:
@@ -3059,7 +3076,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self._stats_ref.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
             else:
                 if self._stats_ref:
-                    self._stats_ref.record_fetch(False)
+                    self._stats_ref.record_fetch(False, updated=result.get("error", "fetch failed"))
             self._json_response(result)
 
         elif path == "/health":
@@ -3147,6 +3164,7 @@ class Stats:
             "avg_latency_ms": 0,
             "total_latency_ms": 0,
             "latency_count": 0,
+            "last_error": None,
             "started_at": datetime.now().isoformat(),
         }
         self._lock = threading.Lock()
@@ -3155,6 +3173,7 @@ class Stats:
         with self._lock:
             if success:
                 self._stats["fetched"] += 1
+                self._stats["last_error"] = None
                 if updated:
                     self._stats["updated"] += 1
                 if latency_ms > 0:
@@ -3165,6 +3184,8 @@ class Stats:
                     )
             else:
                 self._stats["failed"] += 1
+                if isinstance(updated, str) and updated:
+                    self._stats["last_error"] = updated
 
     def get_stats(self):
         with self._lock:
@@ -3399,7 +3420,7 @@ class DataDomeBotEngine:
                             f"{update.get('error', 'unknown error')}"
                         )
                 else:
-                    self.stats.record_fetch(False)
+                    self.stats.record_fetch(False, updated=result.get("error", "fetch failed"))
                     logger.debug(f"[FETCH-{worker_id}] Fetch failed: {result.get('error', '?')}")
 
                 wait_s = (DELAY_MS / 1000.0) if DELAY_MS > 0 else 0
@@ -3409,7 +3430,7 @@ class DataDomeBotEngine:
                     self.shutdown_event.wait(wait_s)
 
             except Exception as e:
-                self.stats.record_fetch(False)
+                self.stats.record_fetch(False, updated=f"{type(e).__name__}: {e}")
                 logger.warning(f"[FETCH-{worker_id}] Unhandled error: {e}")
                 self.shutdown_event.wait(2)
 
