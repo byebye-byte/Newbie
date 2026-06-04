@@ -3171,6 +3171,16 @@ class Stats:
 
     def record_fetch(self, success, latency_ms=0, updated=False):
         with self._lock:
+            for key in ("fetched", "updated", "failed", "total_latency_ms", "latency_count"):
+                try:
+                    self._stats[key] = int(self._stats.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    self._stats[key] = 0
+            try:
+                latency_ms = int(latency_ms or 0)
+            except (TypeError, ValueError):
+                latency_ms = 0
+
             if success:
                 self._stats["fetched"] += 1
                 self._stats["last_error"] = None
@@ -3184,8 +3194,8 @@ class Stats:
                     )
             else:
                 self._stats["failed"] += 1
-                if isinstance(updated, str) and updated:
-                    self._stats["last_error"] = updated
+                if updated:
+                    self._stats["last_error"] = str(updated)
 
     def get_stats(self):
         with self._lock:
@@ -3430,8 +3440,9 @@ class DataDomeBotEngine:
                     self.shutdown_event.wait(wait_s)
 
             except Exception as e:
-                self.stats.record_fetch(False, updated=f"{type(e).__name__}: {e}")
-                logger.warning(f"[FETCH-{worker_id}] Unhandled error: {e}")
+                err_text = f"{type(e).__name__}: {str(e)}"
+                self.stats.record_fetch(False, updated=err_text)
+                logger.warning(f"[FETCH-{worker_id}] Unhandled error: {err_text}")
                 self.shutdown_event.wait(2)
 
         logger.info(f"[FETCH-{worker_id}] Shutting down")
