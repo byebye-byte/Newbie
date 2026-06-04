@@ -67,9 +67,11 @@ COOKIE_FOLDER = os.environ.get("COOKIE_FOLDER", "./data/cookies")  # folder for 
 API_PORT      = int(os.environ.get("API_PORT", "8080"))
 MAX_RETRIES   = int(os.environ.get("MAX_RETRIES", "3"))
 TIMEOUT       = int(os.environ.get("TIMEOUT", "30000")) / 1000  # ms → seconds — residential proxies need more time (30s default)
+DD_FETCH_TIMEOUT = int(os.environ.get("DD_FETCH_TIMEOUT", os.environ.get("FETCH_TIMEOUT", "8000"))) / 1000  # DataDome fetch timeout in seconds
 DELAY_MS      = int(os.environ.get("DELAY_MS", "0"))           # 0 = no delay
 BOT_MODE      = os.environ.get("BOT_MODE", "true").lower() in ("true", "1", "yes")
-NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "20"))        # parallel fetch workers
+NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "20"))        # parallel Garena cookie workers
+DD_FETCH_WORKERS = int(os.environ.get("DD_FETCH_WORKERS", os.environ.get("FETCH_WORKERS", str(NUM_WORKERS))))  # parallel DataDome fetch workers
 PROXY_COOLDOWN = int(os.environ.get("PROXY_COOLDOWN", "120"))    # seconds to skip a failed proxy
 PROXY_VALIDATE = os.environ.get("PROXY_VALIDATE", "true").lower() in ("true", "1", "yes")  # validate proxies on startup
 SOCKS5_SUPPORT = os.environ.get("SOCKS5_SUPPORT", "false").lower() in ("true", "1", "yes")   # auto-add socks5 variant (default: off — most residential proxies only support HTTP)
@@ -3330,7 +3332,7 @@ class DataDomeBotEngine:
         self.updater = CookieUpdater(COOKIE_FILE)
 
         # Fetcher (no interval — as fast as possible)
-        self.fetcher = DataDomeFetcher(self.scanner, max_retries=MAX_RETRIES, timeout=TIMEOUT)
+        self.fetcher = DataDomeFetcher(self.scanner, max_retries=MAX_RETRIES, timeout=DD_FETCH_TIMEOUT)
 
         # DataDome pool (multi-value, smart inject)
         self.dd_pool = DataDomePool(self.updater)
@@ -3371,6 +3373,88 @@ class DataDomeBotEngine:
         APIHandler._stats_ref = self.stats
         APIHandler._fetcher = self.fetcher
         APIHandler._cookie_workers = self.cookie_workers
+        self.fetch_threads = []
+
+    def _fetch_worker_loop(self, worker_id):
+        """Continuously fetch fresh DataDome values and write them to the cookie file."""
+        logger.info(f"[FETCH-{worker_id}] Starting DataDome fetch loop")
+        while not self.shutdown_event.is_set():
+            try:
+                if not self.dd_pool.ready.wait(timeout=1):
+                    continue
+
+                result = self.fetcher.fetch(thread_id=f"dd-fetch-{worker_id}")
+                if result.get("success"):
+                    update = self.updater.update_datadome(result.get("datadome", ""))
+                    updated = bool(update.get("success"))
+                    self.stats.record_fetch(True, result.get("latency_ms", 0), updated)
+                    if updated:
+                        logger.debug(
+                            f"[FETCH-{worker_id}] DataDome updated "
+                            f"({update.get('lines_changed', 0)} lines, {result.get('latency_ms', 0)}ms)"
+                        )
+                    else:
+                        logger.warning(
+                            f"[FETCH-{worker_id}] Fetch succeeded but cookie update failed: "
+                            f"{update.get('error', 'unknown error')}"
+                        )
+                else:
+                    self.stats.record_fetch(False)
+                    logger.debug(f"[FETCH-{worker_id}] Fetch failed: {result.get('error', '?')}")
+
+                wait_s = (DELAY_MS / 1000.0) if DELAY_MS > 0 else 0
+                if not result.get("success"):
+                    wait_s = max(wait_s, 0.25)
+                if wait_s > 0:
+                    self.shutdown_event.wait(wait_s)
+
+            except Exception as e:
+                self.stats.record_fetch(False)
+                logger.warning(f"[FETCH-{worker_id}] Unhandled error: {e}")
+                self.shutdown_event.wait(2)
+
+        logger.info(f"[FETCH-{worker_id}] Shutting down")
+
+    def _start_fetch_workers(self):
+        """Start and monitor the continuous DataDome fetch worker pool."""
+        if DD_FETCH_WORKERS <= 0:
+            logger.info("[FETCH] DataDome fetch workers disabled (DD_FETCH_WORKERS=0)")
+            return
+
+        logger.info(f"[FETCH] Starting {DD_FETCH_WORKERS} DataDome fetch workers")
+        self.tg.send_important(
+            f"<b>{DD_FETCH_WORKERS} DataDome fetch workers starting!</b>\n"
+            f"Fresh values will update the cookie file continuously."
+        )
+
+        for i in range(DD_FETCH_WORKERS):
+            t = threading.Thread(
+                target=self._fetch_worker_loop,
+                args=(i,),
+                name=f"dd-fetch-worker-{i}",
+                daemon=True,
+            )
+            t.start()
+            self.fetch_threads.append(t)
+
+        def monitor_fetch_workers():
+            while not self.shutdown_event.is_set():
+                self.shutdown_event.wait(15)
+                if self.shutdown_event.is_set():
+                    break
+                for i, t in enumerate(self.fetch_threads):
+                    if not t.is_alive():
+                        logger.warning(f"[MONITOR] DataDome fetch worker-{i} died - restarting...")
+                        new_t = threading.Thread(
+                            target=self._fetch_worker_loop,
+                            args=(i,),
+                            name=f"dd-fetch-worker-{i}-restart",
+                            daemon=True,
+                        )
+                        new_t.start()
+                        self.fetch_threads[i] = new_t
+
+        threading.Thread(target=monitor_fetch_workers, name="fetch-worker-monitor", daemon=True).start()
 
     def run(self):
         logger.info("=" * 50)
@@ -3382,6 +3466,8 @@ class DataDomeBotEngine:
         logger.info(f"[BOT] Workers     : {NUM_WORKERS}")
         logger.info(f"[BOT] Delay       : {DELAY_MS}ms")
         logger.info(f"[BOT] Timeout     : {TIMEOUT*1000:.0f}ms")
+        logger.info(f"[BOT] DD timeout  : {DD_FETCH_TIMEOUT*1000:.0f}ms")
+        logger.info(f"[BOT] DD workers  : {DD_FETCH_WORKERS}")
         logger.info(f"[BOT] Proxy cooldown: {PROXY_COOLDOWN}s")
         logger.info(f"[BOT] SOCKS5      : {'ON' if SOCKS5_SUPPORT else 'OFF'}")
         logger.info("=" * 50)
@@ -3430,6 +3516,8 @@ class DataDomeBotEngine:
 
         if self.shutdown_event.is_set():
             return
+
+        self._start_fetch_workers()
 
         # ── START 20 GARENA COOKIE WORKERS ──
         # Each worker independently: get account → get proxy → prelogin → login → append cookie
