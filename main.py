@@ -58,7 +58,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8642663150:AAE2taGFO5HS30aqTY1qyM71CtLmSHB4VCk")
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8873566235:AAFWgBkP8VjoB09mw0uXWoz9sJ70bSQfV1Y")
 CHAT_ID       = os.environ.get("CHAT_ID", "5028065177")
 PROXY_FOLDER  = os.environ.get("PROXY_FOLDER", "./data/proxy")
 COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", "./data/combo")
