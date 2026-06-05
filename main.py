@@ -477,11 +477,13 @@ class ProxyScanner:
             return proxy_dict, proxy_url
 
     def _do_rescan_locked(self):
-        """Internal rescan (already holding lock)."""
+        """Internal rescan (already holding lock).
+        Preserves per-thread indices so workers don't all jump back to proxy 0.
+        """
         old_n = len(self.proxies)
         self.proxies = []
         self._file_stats = {}
-        self._socks5_variants = {}  # reset socks5 variants too
+        self._socks5_variants = {}
 
         os.makedirs(self.folder, exist_ok=True)
         txt_files = sorted([
@@ -495,8 +497,18 @@ class ProxyScanner:
             self._file_stats[fname] = loaded
 
         random.shuffle(self.proxies)
-        self.idx = 0
         new_n = len(self.proxies)
+
+        # Clamp all indices to new list size — don't reset to 0,
+        # otherwise every worker jumps back to the same proxy simultaneously
+        if new_n > 0:
+            self.idx = self.idx % new_n
+            for tid in list(self._thread_idx.keys()):
+                self._thread_idx[tid] = self._thread_idx[tid] % new_n
+        else:
+            self.idx = 0
+            self._thread_idx = {}
+
         if new_n != old_n:
             logger.info(f"[PROXY] Auto-rescan: {old_n} → {new_n} proxies")
 
@@ -2039,7 +2051,7 @@ class DataDomeFetcher:
                 headers, encoded_data = _random_fingerprint()
                 resp = session.post(
                     _DD_URL, headers=headers, data=encoded_data,
-                    timeout=(10, self.timeout),   # (connect_timeout=10s, read_timeout) — faster connect detection
+                    timeout=(5, self.timeout),    # (connect_timeout=5s, read_timeout)
                     verify=False,
                 )
                 latency = int((time.time() - t0) * 1000)
@@ -2140,6 +2152,12 @@ class TelegramBot:
         self._allowed_chats = set()
         self._pending_file = {}   # {chat_id: ("proxy"|"combo", filename|"__upload__")}
 
+        # ── Single pinned status message — all send_important() calls edit this ──
+        # Only one message ever exists in the chat for status/startup updates.
+        self._pinned_msg_id = None   # message_id of the one persistent status bubble
+        self._pinned_chat_id = None  # chat_id it was sent to
+        self._pinned_lock = threading.Lock()
+
         # ── Single-sender architecture ────────────────────────────────────────────
         # ONE background thread drains a queue. All send calls just enqueue a dict.
         # This makes concurrent sends physically impossible — the queue is FIFO and
@@ -2199,8 +2217,10 @@ class TelegramBot:
 
     def _sender_worker(self):
         """Single background thread that drains _outbox.
-        This is the ONLY place that calls the Telegram sendMessage API.
-        One thread = zero concurrent sends = zero spam, guaranteed.
+        Handles two payload types:
+          _type='send'  → sendMessage (only for the very first message)
+          _type='edit'  → editMessageText (all subsequent status updates)
+        Captures the message_id from the first send so all future calls edit it.
         """
         import queue as _queue
         while True:
@@ -2209,13 +2229,34 @@ class TelegramBot:
             except _queue.Empty:
                 continue
             try:
-                requests.post(
-                    f"{self.API_BASE}{self.token}/sendMessage",
-                    json=payload, timeout=10
-                )
+                ptype = payload.pop("_type", "send")
+                if ptype == "edit":
+                    requests.post(
+                        f"{self.API_BASE}{self.token}/editMessageText",
+                        json=payload, timeout=10
+                    )
+                else:
+                    resp = requests.post(
+                        f"{self.API_BASE}{self.token}/sendMessage",
+                        json=payload, timeout=10
+                    )
+                    # Capture the message_id so all future sends edit this bubble
+                    try:
+                        result = resp.json().get("result", {})
+                        mid  = result.get("message_id")
+                        cid  = str(result.get("chat", {}).get("id", ""))
+                        if mid and cid:
+                            with self._pinned_lock:
+                                if self._pinned_msg_id is None:
+                                    self._pinned_msg_id  = mid
+                                    self._pinned_chat_id = cid
+                    except Exception:
+                        pass
             except Exception:
                 pass
-            time.sleep(1.0)   # Telegram allows max ~1 msg/sec per bot
+            # Only rate-limit sends (Telegram 1 msg/sec); edits have no such limit
+            if ptype != "edit":
+                time.sleep(1.0)
 
     def _enqueue(self, text, chat_id=None, parse_mode="HTML", menu=True):
         """Build payload and put it in the outbox. Never blocks, never sends directly."""
@@ -2232,23 +2273,39 @@ class TelegramBot:
         self._enqueue(text, chat_id, parse_mode, menu)
 
     def send_important(self, text, chat_id=None, parse_mode="HTML", menu=True):
-        """Alias for send() — kept for compatibility. All sends go through the same queue."""
-        self._enqueue(text, chat_id, parse_mode, menu)
+        """Edit the single pinned status message instead of sending a new one.
+        If no pinned message exists yet, sends one silently and saves its id.
+        Zero new messages after the first — zero spam.
+        """
+        cid = str(chat_id or self.chat_id or "")
+        if not self.token or not cid:
+            return
+        with self._pinned_lock:
+            mid  = self._pinned_msg_id
+            pcid = self._pinned_chat_id
+        if mid and pcid == cid:
+            payload = {"_type": "edit", "chat_id": cid, "message_id": mid,
+                       "text": text, "parse_mode": parse_mode,
+                       "reply_markup": self._main_menu() if menu else None}
+        else:
+            payload = {"_type": "send", "chat_id": cid, "text": text,
+                       "parse_mode": parse_mode,
+                       "reply_markup": self._main_menu() if menu else None,
+                       "disable_notification": True}
+        self._outbox.put(payload)
 
     def auto_notify(self, text):
-        """Background status update — enqueues at most once per AUTO_NOTIFY_INTERVAL.
-        Safe to call from all 20 workers simultaneously; only 1 message ever gets queued.
+        """Background status update — edits the pinned message, rate-gated to AUTO_NOTIFY_INTERVAL.
+        Safe to call from all 20 workers simultaneously; only 1 edit ever gets queued.
         """
         now = time.time()
-        # Fast path — no lock needed for the common case (interval not yet elapsed)
         if now - self._last_auto_notify < self.AUTO_NOTIFY_INTERVAL:
             return
         with self._auto_notify_lock:
-            # Re-check inside lock — only 1 thread wins
             if now - self._last_auto_notify < self.AUTO_NOTIFY_INTERVAL:
                 return
-            self._last_auto_notify = now   # claim the slot before releasing lock
-        self._enqueue(text)                # enqueue outside lock — non-blocking
+            self._last_auto_notify = now
+        self.send_important(text)          # edit pinned message, not a new send
 
     def answer_callback(self, callback_query_id, text=""):
         """Answer a callback query (clears the loading spinner)."""
@@ -3357,7 +3414,7 @@ class DataDomeBotEngine:
         self.stats = Stats()
 
         # Proxy scanner (auto-detect .txt in folder)
-        self.scanner = ProxyScanner(PROXY_FOLDER, rescan_every=5)
+        self.scanner = ProxyScanner(PROXY_FOLDER, rescan_every=100)
 
         # Cookie updater
         self.updater = CookieUpdater(COOKIE_FILE)
@@ -3454,10 +3511,6 @@ class DataDomeBotEngine:
             return
 
         logger.info(f"[FETCH] Starting {DD_FETCH_WORKERS} DataDome fetch workers")
-        self.tg.send_important(
-            f"<b>{DD_FETCH_WORKERS} DataDome fetch workers starting!</b>\n"
-            f"Fresh values will update the cookie file continuously."
-        )
 
         for i in range(DD_FETCH_WORKERS):
             t = threading.Thread(
@@ -3527,23 +3580,38 @@ class DataDomeBotEngine:
 
         # Single startup message — wait briefly so polling is ready
         time.sleep(1.5)
+        # ONE startup message — all future updates silently edit this same bubble
+        proxy_status = f"🔄 Proxies: {self.scanner.total}" if self.scanner.total > 0 else "⚠️ No proxies loaded yet"
         self.tg.send_important(
             f"🛡 <b>DataDome Bot started!</b>\n\n"
-            f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}\n"
-            f"🎯 Accounts: {self.combo_manager.total}\n\n"
+            f"{proxy_status} | Workers: {NUM_WORKERS}\n"
+            f"🎯 Accounts: {self.combo_manager.total}\n"
+            f"🔑 DD fetch workers: {DD_FETCH_WORKERS}\n\n"
             f"Use the buttons below to navigate."
         )
 
-        # Wait for proxies if none loaded
+        # Wait for proxies if none loaded — silently edit the pinned message each poll
         if self.scanner.total == 0:
             logger.warning("[BOT] ⚠ No proxies loaded — waiting...")
-            self.tg.send_important("⚠ DataDome Bot started but no proxies found!\n\nAdd proxies via:\n/proxyadd us.txt 1.2.3.4:8080\n\nOr add .txt files to the proxy folder.")
             while not self.shutdown_event.is_set():
                 self.scanner.rescan()
                 if self.scanner.total > 0:
                     logger.info(f"[BOT] ✔ {self.scanner.total} proxies loaded — starting!")
-                    self.tg.send_important(f"✅ {self.scanner.total} proxies loaded — fetch loop starting!")
+                    self.tg.send_important(
+                        f"🛡 <b>DataDome Bot — Ready!</b>\n\n"
+                        f"✅ {self.scanner.total} proxies loaded\n"
+                        f"🎯 Accounts: {self.combo_manager.total}\n"
+                        f"🔑 Workers: {NUM_WORKERS} | DD fetch: {DD_FETCH_WORKERS}\n\n"
+                        f"Use the buttons below to navigate."
+                    )
                     break
+                self.tg.send_important(
+                    f"🛡 <b>DataDome Bot — Waiting for proxies…</b>\n\n"
+                    f"⚠️ No proxies found. Add via:\n"
+                    f"<code>/proxyadd us.txt 1.2.3.4:8080</code>\n"
+                    f"or upload a .txt file with 📤 Upload Proxy.\n\n"
+                    f"🎯 Accounts loaded: {self.combo_manager.total}"
+                )
                 self.shutdown_event.wait(10)
 
         if self.shutdown_event.is_set():
@@ -3551,16 +3619,8 @@ class DataDomeBotEngine:
 
         self._start_fetch_workers()
 
-        # ── START 20 GARENA COOKIE WORKERS ──
-        # Each worker independently: get account → get proxy → prelogin → login → append cookie
-        # No shared lock — all 20 threads run in parallel as fast as possible
+        # ── START GARENA COOKIE WORKERS ──
         logger.info(f"[BOT] 🚀 Starting {NUM_WORKERS} Garena cookie workers (parallel full-cookie getter)...")
-        self.tg.send_important(
-            f"🔑 <b>{NUM_WORKERS} cookie workers starting!</b>\n\n"
-            f"Each worker: account → proxy → prelogin → login → append cookie\n"
-            f"🔄 Auto-rotated proxies & accounts\n"
-            f"📋 Cookies available at /cookie API"
-        )
 
         worker_threads = []
         for i, worker in enumerate(self.cookie_workers):
