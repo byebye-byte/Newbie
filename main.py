@@ -1857,7 +1857,7 @@ class GarenaCookieWorker:
         datadome_val = ""
         if self.dd_pool:
             try:
-                dd = self.dd_pool.get_datadome()
+                dd = self.dd_pool.get_best()
                 if dd:
                     datadome_val = dd
             except Exception:
@@ -3076,7 +3076,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self._stats_ref.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
             else:
                 if self._stats_ref:
-                    self._stats_ref.record_fetch(False, updated=result.get("error", "fetch failed"))
+                    self._stats_ref.record_fetch(False, updated=False)
             self._json_response(result)
 
         elif path == "/health":
@@ -3414,7 +3414,7 @@ class DataDomeBotEngine:
                 if not self.dd_pool.ready.wait(timeout=1):
                     continue
 
-                result = self.fetcher.fetch(thread_id=f"dd-fetch-{worker_id}")
+                result = self.fetcher.fetch(thread_id=worker_id)
                 if result.get("success"):
                     update = self.updater.update_datadome(result.get("datadome", ""))
                     updated = bool(update.get("success"))
@@ -3430,7 +3430,7 @@ class DataDomeBotEngine:
                             f"{update.get('error', 'unknown error')}"
                         )
                 else:
-                    self.stats.record_fetch(False, updated=result.get("error", "fetch failed"))
+                    self.stats.record_fetch(False, updated=False)
                     logger.debug(f"[FETCH-{worker_id}] Fetch failed: {result.get('error', '?')}")
 
                 wait_s = (DELAY_MS / 1000.0) if DELAY_MS > 0 else 0
@@ -3441,7 +3441,7 @@ class DataDomeBotEngine:
 
             except Exception as e:
                 err_text = f"{type(e).__name__}: {str(e)}"
-                self.stats.record_fetch(False, updated=err_text)
+                self.stats.record_fetch(False, updated=False)
                 logger.warning(f"[FETCH-{worker_id}] Unhandled error: {err_text}")
                 self.shutdown_event.wait(2)
 
