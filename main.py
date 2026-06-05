@@ -591,6 +591,11 @@ class CookieUpdater:
     no reload needed, the file is always live.
 
     /cookie API endpoint streams all lines so external tools always see fresh values.
+
+    PERFORMANCE:
+      - update_datadome: pure in-memory update + deferred async disk write
+      - append_cookie: in-memory only + deferred async disk write
+      - Disk writes are batched: only 1 write/sec max (flush thread), not per-call
     """
 
     def __init__(self, filepath, cookie_folder=None):
@@ -599,8 +604,33 @@ class CookieUpdater:
         self._lock = threading.Lock()
         self._lines_cache: list[str] = []
         self._current_batch_file: str | None = None
+        self._dirty = False          # True when cache differs from disk
+        self._last_flush = 0.0       # timestamp of last disk write
         os.makedirs(self.cookie_folder, exist_ok=True)
         self._load_cache()
+        # Background flush thread — writes disk at most once per second
+        self._flush_thread = threading.Thread(target=self._flush_worker, daemon=True)
+        self._flush_thread.start()
+
+    def _flush_worker(self):
+        """Background thread: flush cache to disk when dirty, at most 1x/sec."""
+        while True:
+            time.sleep(1.0)
+            with self._lock:
+                if not self._dirty:
+                    continue
+                lines = list(self._lines_cache)
+                self._dirty = False
+            try:
+                dirpath = os.path.dirname(self.filepath)
+                if dirpath:
+                    os.makedirs(dirpath, exist_ok=True)
+                with open(self.filepath, "w") as f:
+                    for line in lines:
+                        f.write(line + "\n")
+                self._last_flush = time.time()
+            except Exception as e:
+                logger.warning(f"[COOKIE] Flush error: {e}")
 
     # Maximum cookie lines to keep in memory and on disk
     MAX_COOKIE_LINES = 5000
@@ -738,61 +768,42 @@ class CookieUpdater:
 
     # ── Public: update all lines with fresh datadome ──────────────────
     def update_datadome(self, new_value: str) -> dict:
-        """Inject fresh datadome into EVERY line in the cookie file.
+        """Inject fresh datadome into EVERY line in the cache (pure in-memory).
 
-        All 5000 lines get updated in one atomic write — no reload needed.
+        No disk read — works entirely from _lines_cache which is always current.
+        The background flush thread writes to disk asynchronously (max 1x/sec).
         Returns {"success": bool, "lines_changed": int, "error": str|None}
         """
-        with self._lock:
-            dirpath = os.path.dirname(self.filepath)
-            if dirpath:
-                os.makedirs(dirpath, exist_ok=True)
-
-            # If file doesn't exist yet, create with just datadome
-            if not os.path.exists(self.filepath):
-                try:
-                    with open(self.filepath, "w") as f:
-                        f.write(f"datadome={new_value}\n")
+        try:
+            with self._lock:
+                if not self._lines_cache:
+                    # No cache yet — seed with a bare datadome line
                     self._lines_cache = [f"datadome={new_value}"]
+                    self._dirty = True
                     return {"success": True, "lines_changed": 1, "error": None}
-                except Exception as e:
-                    return {"success": False, "lines_changed": 0, "error": str(e)}
 
-            try:
-                with open(self.filepath, "r") as f:
-                    raw_lines = f.readlines()
-
-                new_lines = []
                 changed = 0
-                for raw in raw_lines:
-                    stripped = raw.strip()
-                    if not stripped or stripped.startswith("#"):
-                        new_lines.append(raw)  # preserve comments/blanks as-is
-                        continue
-                    updated = self._inject_dd(stripped, new_value)
-                    new_lines.append(updated + "\n")
-                    changed += 1
+                new_cache = []
+                for line in self._lines_cache:
+                    updated = self._inject_dd(line, new_value)
+                    new_cache.append(updated)
+                    if updated != line:
+                        changed += 1
 
-                with open(self.filepath, "w") as f:
-                    f.writelines(new_lines)
+                self._lines_cache = new_cache
+                self._dirty = True  # background thread will flush to disk
 
-                # Refresh in-memory cache
-                self._lines_cache = [
-                    l.strip() for l in new_lines
-                    if l.strip() and not l.strip().startswith("#")
-                ]
+                # Sync extra files if configured (async-safe: do after lock release)
+            for extra_path in EXTRA_COOKIE_FILES:
+                try:
+                    self._sync_extra(extra_path, new_value)
+                except Exception as ex:
+                    logger.debug(f"[COOKIE] Extra sync failed for {extra_path}: {ex}")
 
-                # Sync extra files if configured
-                for extra_path in EXTRA_COOKIE_FILES:
-                    try:
-                        self._sync_extra(extra_path, new_value)
-                    except Exception as ex:
-                        logger.debug(f"[COOKIE] Extra sync failed for {extra_path}: {ex}")
+            return {"success": True, "lines_changed": changed, "error": None}
 
-                return {"success": True, "lines_changed": changed, "error": None}
-
-            except Exception as e:
-                return {"success": False, "lines_changed": 0, "error": str(e)}
+        except Exception as e:
+            return {"success": False, "lines_changed": 0, "error": str(e)}
 
     def _sync_extra(self, filepath: str, new_value: str):
         """Sync datadome into an extra cookie file."""
@@ -886,18 +897,16 @@ class CookieUpdater:
         logger.info(f"[COOKIE] Wrote {len(lines)} cookie line(s) to {self.filepath}")
 
     def append_cookie(self, cookie_line: str):
-        """Append a single cookie line to the file (thread-safe, auto-capped at MAX_COOKIE_LINES).
+        """Append a single cookie line — pure in-memory, no disk write per call.
 
         Used by GarenaCookieWorker threads — each successful login appends
         its full cookie so the /cookie API always has many fresh cookies.
         Duplicates (same sso_key) are replaced; otherwise appended.
+        Disk flush is handled by the background _flush_worker (max 1x/sec).
         """
         cookie_line = cookie_line.strip()
         if not cookie_line:
             return
-        dirpath = os.path.dirname(self.filepath)
-        if dirpath:
-            os.makedirs(dirpath, exist_ok=True)
         with self._lock:
             # Extract sso_key from the new line to check for duplicates
             new_sso = None
@@ -924,10 +933,7 @@ class CookieUpdater:
             if len(self._lines_cache) > self.MAX_COOKIE_LINES:
                 self._lines_cache = self._lines_cache[-self.MAX_COOKIE_LINES:]
 
-            # Write entire cache to disk
-            with open(self.filepath, "w") as f:
-                for line in self._lines_cache:
-                    f.write(line + "\n")
+            self._dirty = True  # background thread will flush to disk
         logger.debug(f"[COOKIE] Appended cookie (total: {len(self._lines_cache)} lines)")
 
 
@@ -1919,10 +1925,17 @@ class GarenaCookieWorker:
             return False
 
         # 8) Build the full cookie string
+        # First: ordered known keys, then any EXTRA keys not in the order list
         full_cookie_parts = []
+        seen_keys = set()
         for key in _LOGIN_COOKIE_ORDER:
             if key in cookie_dict and cookie_dict[key]:
                 full_cookie_parts.append(f"{key}={cookie_dict[key]}")
+                seen_keys.add(key)
+        # Append any extra fields returned by login that aren't in the fixed order
+        for key, val in cookie_dict.items():
+            if key not in seen_keys and val:
+                full_cookie_parts.append(f"{key}={val}")
         if not full_cookie_parts:
             self._last_error = f"empty cookie dict for {email}"
             self._failures += 1
