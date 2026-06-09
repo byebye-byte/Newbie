@@ -632,8 +632,10 @@ class CookieUpdater:
             except Exception as e:
                 logger.warning(f"[COOKIE] Flush error: {e}")
 
-    # Maximum cookie lines to keep in memory and on disk
-    MAX_COOKIE_LINES = 5000
+    # Maximum cookie lines to keep in memory and on disk.
+    # Kept low to prevent RAM bloat — 500 is more than enough
+    # for a rotating cookie pool. Oldest entries auto-dropped when over limit.
+    MAX_COOKIE_LINES = 500
 
     def _load_cache(self):
         """Load all non-empty, non-comment cookie lines into memory — capped at MAX_COOKIE_LINES."""
@@ -844,22 +846,32 @@ class CookieUpdater:
             pass
         return None
 
+    @staticmethod
+    def _strip_ts_tag(line: str) -> str:
+        """Remove the internal ;__ts=<epoch> timestamp tag before serving cookies."""
+        idx = line.find(" ;__ts=")
+        if idx != -1:
+            return line[:idx]
+        return line
+
     def read_full_cookie(self) -> str | None:
         """Return the single richest cookie line (most fields).
 
         Used by the combo harvester for prelogin requests.
+        __ts tag is stripped before returning.
         """
         with self._lock:
             best = None
             best_count = 0
             for line in self._lines_cache:
-                fields = [p.strip() for p in line.split(";") if p.strip()]
+                clean = self._strip_ts_tag(line)
+                fields = [p.strip() for p in clean.split(";") if p.strip()]
                 # Skip bare datadome-only lines
                 if len(fields) == 1 and fields[0].lower().startswith("datadome="):
                     continue
                 if len(fields) > best_count:
                     best_count = len(fields)
-                    best = line
+                    best = clean
             if best is None:
                 logger.warning(
                     f"[COOKIE] No full cookie line found — set COOKIE env var or use /cookieset"
@@ -869,9 +881,11 @@ class CookieUpdater:
     def read_all_cookies(self) -> list[str]:
         """Return ALL cookie lines shuffled — so every checker request gets a different
         cookie order and no single cookie gets hammered repeatedly.
+        __ts timestamp tags are stripped before returning so external callers
+        never see the internal tracking field.
         """
         with self._lock:
-            copy = list(self._lines_cache)
+            copy = [self._strip_ts_tag(ln) for ln in self._lines_cache]
         random.shuffle(copy)
         return copy
 
@@ -896,6 +910,12 @@ class CookieUpdater:
             logger.info(f"[COOKIE] write_cookie: trimmed {trimmed} lines beyond limit ({self.MAX_COOKIE_LINES} kept)")
         logger.info(f"[COOKIE] Wrote {len(lines)} cookie line(s) to {self.filepath}")
 
+    # Cookies older than this are stale and get auto-purged on append.
+    # Garena datadome TTL ~30min — purge at 25min to stay safe.
+    COOKIE_TTL_SEC = 25 * 60
+    _append_count  = 0
+    PURGE_EVERY    = 50  # run purge check every 50 appends
+
     def append_cookie(self, cookie_line: str):
         """Append a single cookie line — pure in-memory, no disk write per call.
 
@@ -903,10 +923,19 @@ class CookieUpdater:
         its full cookie so the /cookie API always has many fresh cookies.
         Duplicates (same sso_key) are replaced; otherwise appended.
         Disk flush is handled by the background _flush_worker (max 1x/sec).
+
+        AUTO-PURGE: Every PURGE_EVERY appends, cookies older than COOKIE_TTL_SEC
+        are removed so RAM stays bounded even on long Railway runs.
+        Hard cap at MAX_COOKIE_LINES as final safety net.
         """
         cookie_line = cookie_line.strip()
         if not cookie_line:
             return
+
+        now = time.time()
+        # Embed timestamp tag so we can purge stale entries later
+        tagged_line = cookie_line + f" ;__ts={int(now)}"
+
         with self._lock:
             # Extract sso_key from the new line to check for duplicates
             new_sso = None
@@ -921,20 +950,51 @@ class CookieUpdater:
                 replaced = False
                 for i, existing in enumerate(self._lines_cache):
                     if f"sso_key={new_sso}" in existing:
-                        self._lines_cache[i] = cookie_line
+                        self._lines_cache[i] = tagged_line
                         replaced = True
                         break
                 if not replaced:
-                    self._lines_cache.append(cookie_line)
+                    self._lines_cache.append(tagged_line)
             else:
-                self._lines_cache.append(cookie_line)
+                self._lines_cache.append(tagged_line)
 
-            # Cap at MAX_COOKIE_LINES — drop oldest if over limit
+            # ── TTL purge every PURGE_EVERY appends ──────────────────────
+            self._append_count += 1
+            if self._append_count % self.PURGE_EVERY == 0:
+                cutoff = now - self.COOKIE_TTL_SEC
+                before = len(self._lines_cache)
+                self._lines_cache = [
+                    ln for ln in self._lines_cache
+                    if CookieUpdater._extract_ts(ln) >= cutoff
+                ]
+                purged = before - len(self._lines_cache)
+                if purged:
+                    logger.info(
+                        f"[COOKIE] 🗑 Purged {purged} stale cookies "
+                        f"(>{self.COOKIE_TTL_SEC // 60}min old) — "
+                        f"{len(self._lines_cache)} remain"
+                    )
+
+            # ── Hard cap — drop oldest if still over limit ────────────────
             if len(self._lines_cache) > self.MAX_COOKIE_LINES:
+                dropped = len(self._lines_cache) - self.MAX_COOKIE_LINES
                 self._lines_cache = self._lines_cache[-self.MAX_COOKIE_LINES:]
+                logger.info(f"[COOKIE] ✂ Hard cap: dropped {dropped} oldest (limit={self.MAX_COOKIE_LINES})")
 
             self._dirty = True  # background thread will flush to disk
         logger.debug(f"[COOKIE] Appended cookie (total: {len(self._lines_cache)} lines)")
+
+    @staticmethod
+    def _extract_ts(line: str) -> float:
+        """Extract embedded __ts=<epoch> timestamp from a tagged cookie line.
+        Returns 0.0 if tag is missing (treat as very old — eligible for purge)."""
+        try:
+            idx = line.find("__ts=")
+            if idx == -1:
+                return 0.0
+            return float(line[idx + 5:].split(";")[0].strip())
+        except Exception:
+            return 0.0
 
 
 
